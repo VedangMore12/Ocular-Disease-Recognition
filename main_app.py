@@ -1,312 +1,338 @@
 import os
-import textwrap
+import tempfile
+import threading
+import uuid
+from pathlib import Path
+
+import gradio as gr
+from gradio.themes import Soft
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import torch
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
-from tkinter import filedialog, messagebox
-from tkinter.scrolledtext import ScrolledText
-from PIL import Image, ImageTk
-from model.train_model import load_trained_model
-from model.gradcam import generate_gradcam
-from utils.preprocess import preprocess_image
-from utils.recommend import get_recommendations
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
+from model.gradcam import generate_gradcam
+from model.train_model import DISEASE_CLASSES, evaluate_model, load_trained_model
+from utils.preprocess import preprocess_image
+from utils.recommend import get_recommendations
 
-class OcularApp(ttk.Window):
+
+PROJECT_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(
+    os.environ.get(
+        "OCULAR_MODEL_PATH",
+        str(PROJECT_DIR / "model" / "model_weights.pth"),
+    )
+)
+CSV_PATH = PROJECT_DIR / "full_df.csv"
+
+DISEASE_SUMMARIES = {
+    "Normal": "The model did not identify one of the listed abnormalities.",
+    "Diabetes": "The model identified retinal patterns associated with the diabetes class.",
+    "Glaucoma": "The model identified retinal patterns associated with the glaucoma class.",
+    "Cataract": "The model identified retinal patterns associated with the cataract class.",
+    "Age-related Macular Degeneration": (
+        "The model identified retinal patterns associated with the macular degeneration class."
+    ),
+    "Hypertension": "The model identified retinal patterns associated with the hypertension class.",
+    "Pathological Myopia": (
+        "The model identified retinal patterns associated with the pathological myopia class."
+    ),
+    "Other Diseases": "The model identified patterns assigned to the other diseases class.",
+}
+
+
+class OcularPredictor:
     def __init__(self):
-        super().__init__(themename="flatly")  # clean, modern, medical-grade UI
-        self.title("Ocular Disease Recognition and Wellness System")
-        self.state("zoomed")
-        self.configure(padx=20, pady=20)
+        if not MODEL_PATH.is_file():
+            raise FileNotFoundError(f"Trained model weights not found: {MODEL_PATH}")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = load_trained_model()
-        self.model = self.model.to(self.device)
-        self.image_paths = [None, None]
-        self.tk_images = [None, None]
-        self.heatmap_paths = [None, None]
+        self.model = load_trained_model(str(MODEL_PATH)).to(self.device)
+        self.lock = threading.Lock()
 
-        self.setup_ui()
-        self.setup_styles()
+    def predict(self, left_image, right_image, age, sex, diabetes, hypertension):
+        image_paths = [path for path in (left_image, right_image) if path]
+        if not image_paths:
+            raise gr.Error("Upload at least one fundus image.")
 
-    def setup_styles(self):
-        """Define a clean, uniform font and color scheme for UI elements"""
-        style = ttk.Style()
-        style.configure("TLabel", font=("Segoe UI", 11))
-        style.configure("TButton", font=("Segoe UI", 10, "bold"))
-        style.configure("TFrame", background="#f8f9fa")
-        style.configure("TLabelframe", background="#f8f9fa")
-        style.configure("TLabelframe.Label", font=("Segoe UI", 13, "bold"))
-
-    def setup_ui(self):
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=3)
-        self.rowconfigure(0, weight=1)
-
-        # LEFT PANEL
-        left_frame = ttk.Frame(self, padding=25)
-        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
-        left_frame.columnconfigure(0, weight=1)
-
-        ttk.Label(
-            left_frame,
-            text="Ocular Disease Recognition",
-            font=("Segoe UI", 22, "bold"),
-            bootstyle="secondary"
-        ).pack(pady=(10, 30))
-
-        upload_frame = ttk.Frame(left_frame)
-        upload_frame.pack(fill=X, pady=10)
-
-        self.upload_btn1 = ttk.Button(upload_frame, text="Upload Image 1", bootstyle="info",
-                                      command=lambda: self.upload_image(0))
-        self.upload_btn1.pack(fill=X, pady=5)
-        self.file_label1 = ttk.Label(upload_frame, text="No file selected", font=("Segoe UI", 9, "italic"))
-        self.file_label1.pack(pady=(0, 10))
-
-        self.upload_btn2 = ttk.Button(upload_frame, text="Upload Image 2", bootstyle="info",
-                                      command=lambda: self.upload_image(1))
-        self.upload_btn2.pack(fill=X, pady=5)
-        self.file_label2 = ttk.Label(upload_frame, text="No file selected", font=("Segoe UI", 9, "italic"))
-        self.file_label2.pack(pady=(0, 10))
-
-        ttk.Separator(left_frame).pack(fill=X, pady=15)
-
-        ttk.Label(left_frame, text="Patient Information", font=("Segoe UI", 14, "bold")).pack(pady=(10, 10))
-
-        # AGE ENTRY
-        age_frame = ttk.Frame(left_frame)
-        age_frame.pack(pady=5, fill=X)
-        ttk.Label(age_frame, text="Age:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
-        self.age_var = ttk.StringVar()
-        self.age_entry = ttk.Entry(age_frame, textvariable=self.age_var, width=12)
-        self.age_entry.pack(side="left", fill=X, expand=True)
-        self.age_entry.insert(0, "Enter Age")
-
-        def clear_placeholder(event):
-            if self.age_entry.get() == "Enter Age":
-                self.age_entry.delete(0, "end")
-
-        def restore_placeholder(event):
-            if self.age_entry.get().strip() == "":
-                self.age_entry.insert(0, "Enter Age")
-
-        self.age_entry.bind("<FocusIn>", clear_placeholder)
-        self.age_entry.bind("<FocusOut>", restore_placeholder)
-
-        # SEX DROPDOWN
-        sex_frame = ttk.Frame(left_frame)
-        sex_frame.pack(pady=5, fill=X)
-        ttk.Label(sex_frame, text="Sex:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
-        self.sex_var = ttk.StringVar(value="Select")
-        sex_menu = ttk.Combobox(sex_frame, textvariable=self.sex_var, values=["Male", "Female"], state="readonly",
-                                width=12)
-        sex_menu.pack(side="left", fill=X, expand=True)
-
-        # CHECKBOXES
-        self.diabetes_var = ttk.BooleanVar()
-        self.hypertension_var = ttk.BooleanVar()
-        ttk.Checkbutton(left_frame, text="Diabetes", variable=self.diabetes_var).pack(pady=5, anchor="w")
-        ttk.Checkbutton(left_frame, text="Hypertension", variable=self.hypertension_var).pack(pady=5, anchor="w")
-
-        ttk.Separator(left_frame).pack(fill=X, pady=20)
-
-        # ACTION BUTTONS
-        ttk.Button(left_frame, text="Run Diagnosis", bootstyle="success",
-                   command=self.run_diagnosis).pack(pady=10, fill=X)
-        ttk.Button(left_frame, text="Clear", bootstyle="danger",
-                   command=self.clear_all).pack(pady=10, fill=X)
-
-        # RIGHT PANEL
-        right_panel = ttk.Frame(self, padding=20)
-        right_panel.grid(row=0, column=1, sticky="nsew")
-        right_panel.columnconfigure(0, weight=1)
-        right_panel.rowconfigure(0, weight=4)
-        right_panel.rowconfigure(1, weight=1)
-
-        # IMAGE DISPLAY
-        self.image_frame = ttk.Frame(right_panel)
-        self.image_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 15))
-
-        self.image_labels = []
-        for i in range(2):
-            lbl = ttk.Label(self.image_frame, text=f"No Image {i + 1}",
-                            font=("Segoe UI", 14, "italic"), anchor="center")
-            lbl.grid(row=0, column=i, padx=10, sticky="nsew")
-            self.image_frame.columnconfigure(i, weight=1)
-            self.image_labels.append(lbl)
-
-        # RESULTS FRAME
-        results_frame = ttk.Labelframe(right_panel, text="Diagnosis Results", padding=15)
-        results_frame.grid(row=1, column=0, sticky="nsew")
-        results_frame.columnconfigure(0, weight=1)
-
-        self.result_text = ScrolledText(results_frame, wrap="word", font=("Consolas", 11), height=10)
-        self.result_text.pack(expand=True, fill=BOTH)
-
-    # ------------------ LOGIC METHODS ------------------
-
-    def upload_image(self, index):
-        file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg *.png *.jpeg")])
-        if file_path:
-            self.image_paths[index] = file_path
-            img = Image.open(file_path)
-            img.thumbnail((350, 350))
-            tk_img = ImageTk.PhotoImage(img)
-            self.image_labels[index].configure(image=tk_img, text="")
-            self.image_labels[index].image = tk_img
-            (self.file_label1 if index == 0 else self.file_label2).configure(text=os.path.basename(file_path))
-
-    def clear_all(self):
-        self.image_paths = [None, None]
-        for i, lbl in enumerate(self.image_labels):
-            lbl.configure(image="", text=f"No Image {i + 1}")
-            lbl.image = None
-        self.file_label1.configure(text="No file selected")
-        self.file_label2.configure(text="No file selected")
-        self.result_text.delete("1.0", "end")
-        self.age_entry.delete(0, "end")
-        self.age_entry.insert(0, "Enter Age")
-        self.sex_var.set("Select")
-        self.diabetes_var.set(False)
-        self.hypertension_var.set(False)
-
-    def run_diagnosis(self):
-        valid_paths = [p for p in self.image_paths if p]
-        if not valid_paths:
-            messagebox.showwarning("Warning", "Please upload at least one image first.")
-            return
-
-        try:
-            self.result_text.delete("1.0", "end")
-            self.result_text.insert("end", "Analyzing images... please wait...\n")
-            self.update_idletasks()
-
-            all_probs = []
-            for idx, path in enumerate(valid_paths):
-                img_tensor = preprocess_image(path)
-                img_batch = img_tensor.unsqueeze(0).to(self.device) if img_tensor.dim() == 3 else img_tensor.to(self.device)
-
+        with self.lock:
+            logits = []
+            for image_path in image_paths:
+                image_tensor = preprocess_image(image_path).unsqueeze(0).to(self.device)
                 with torch.no_grad():
-                    outputs = self.model(img_batch)
-                    probs_tensor = torch.sigmoid(outputs).squeeze(0).cpu()
-                all_probs.append(probs_tensor)
+                    logits.append(self.model(image_tensor).squeeze(0))
 
-                try:
-                    heatmap_path = generate_gradcam(self.model, path, probs_tensor)
-                except Exception:
-                    try:
-                        pred_idx = int(torch.argmax(probs_tensor).item())
-                        heatmap_path = generate_gradcam(self.model, path, pred_idx)
-                    except Exception:
-                        heatmap_path = None
-                self.heatmap_paths[idx] = heatmap_path
+            averaged_logits = torch.stack(logits).mean(dim=0)
+            probabilities = torch.softmax(averaged_logits, dim=0).cpu().numpy()
+            predicted_index = int(np.argmax(probabilities))
+            disease = DISEASE_CLASSES[predicted_index]
+            score = float(probabilities[predicted_index])
 
-                if heatmap_path and os.path.exists(heatmap_path):
-                    heat_img = Image.open(heatmap_path)
-                    heat_img.thumbnail((350, 350))
-                    tk_heat = ImageTk.PhotoImage(heat_img)
-                    self.image_labels[idx].configure(image=tk_heat, text="")
-                    self.image_labels[idx].image = tk_heat
+            heatmaps = []
+            for image_path in image_paths:
+                heatmap_path = os.path.join(
+                    tempfile.gettempdir(), f"ocular_gradcam_{uuid.uuid4().hex}.png"
+                )
+                heatmaps.append(
+                    generate_gradcam(
+                        self.model,
+                        image_path,
+                        predicted_index,
+                        output_path=heatmap_path,
+                    )
+                )
 
-            avg_probs = torch.mean(torch.stack(all_probs), dim=0)
-            avg_conf_val, pred_class_idx = torch.max(avg_probs, dim=0)
-            avg_conf = float(avg_conf_val.item())
-            pred_idx = int(pred_class_idx.item())
+        recommendation_disease = (
+            "Diabetic Retinopathy" if disease == "Diabetes" else disease
+        )
+        recommendations = get_recommendations(
+            recommendation_disease,
+            "" if age is None else str(int(age)),
+            sex or "",
+            diabetes,
+            hypertension,
+        )
+        if not recommendations:
+            recommendations = "No specific recommendations are available for this class."
 
-            disease_map = {
-                0: "Normal (N)",
-                1: "Diabetes (D)",
-                2: "Glaucoma (G)",
-                3: "Cataract (C)",
-                4: "Age-related Macular Degeneration (A)",
-                5: "Hypertension (H)",
-                6: "Pathological Myopia (M)",
-                7: "Other diseases/abnormalities (O)"
-            }
+        report_path = self._create_report(
+            disease,
+            score,
+            age,
+            sex,
+            recommendations,
+        )
+        class_scores = {
+            name: float(probabilities[index])
+            for index, name in enumerate(DISEASE_CLASSES)
+        }
+        summary = (
+            f"### {disease}\n\n"
+            f"Model score: **{score:.1%}**\n\n"
+            f"{DISEASE_SUMMARIES[disease]}\n\n"
+            "This result is for educational purposes and is not a medical diagnosis."
+        )
+        return (
+            class_scores,
+            summary,
+            recommendations,
+            heatmaps[0],
+            heatmaps[1] if len(heatmaps) > 1 else None,
+            report_path,
+        )
 
-            disease_name = disease_map.get(pred_idx, "Unknown")
-
-            summary_map = {
-                "Normal (N)": "Healthy retinal structure detected. No visible abnormalities.",
-                "Diabetes (D)": "Signs of diabetic retinopathy such as microaneurysms or hemorrhages may be present.",
-                "Glaucoma (G)": "Possible optic nerve cupping observed, may indicate increased intraocular pressure.",
-                "Cataract (C)": "Lens opacity or cloudiness detected, which can reduce vision clarity.",
-                "Age-related Macular Degeneration (A)": "Degeneration in the central retina area possibly linked to aging.",
-                "Hypertension (H)": "Retinal vessel narrowing or hemorrhages suggestive of hypertensive retinopathy.",
-                "Pathological Myopia (M)": "Elongated eyeball and retinal thinning suggest high myopia risk.",
-                "Other diseases/abnormalities (O)": "Detected abnormalities not matching known disease categories."
-            }
-            summary = summary_map.get(disease_name, "Summary unavailable.")
-
-            age = self.age_entry.get()
-            sex = self.sex_var.get()
-            diabetes = self.diabetes_var.get()
-            hypertension = self.hypertension_var.get()
-            recommendations = get_recommendations(disease_name, age, sex, diabetes, hypertension) or "No specific recommendations available."
-
-            wrapped_summary = textwrap.fill(summary, width=100)
-            wrapped_recommendations = textwrap.fill(recommendations, width=100)
-
-            self.result_text.delete("1.0", "end")
-            self.result_text.insert("end",
-                f"Disease: {disease_name}\n"
-                f"Confidence: {avg_conf:.2f}\n\n"
-                f"Summary:\n{wrapped_summary}\n\n"
-                f"Recommendations:\n{wrapped_recommendations}"
+    def evaluate(self):
+        with self.lock:
+            results = evaluate_model(
+                self.model,
+                csv_path=str(CSV_PATH),
+                device=self.device,
             )
 
-            self.generate_visual_report(disease_name, avg_conf, wrapped_summary, wrapped_recommendations)
+        metrics = [
+            ("Accuracy", results["accuracy"]),
+            ("Balanced accuracy", results["balanced_accuracy"]),
+            ("Macro precision", results["macro_precision"]),
+            ("Macro recall", results["macro_recall"]),
+            ("Macro F1", results["macro_f1"]),
+            ("Weighted F1", results["weighted_f1"]),
+        ]
+        metrics_markdown = (
+            f"### Validation results ({results['validation_samples']} images)\n\n"
+            "| Metric | Score |\n|:--|--:|\n"
+            + "\n".join(f"| {name} | {value:.2%} |" for name, value in metrics)
+            + "\n\n"
+            "The report uses the fixed, patient-grouped 20% validation split. "
+            "It is not an independent test-set result or a clinical performance claim."
+        )
 
-        except Exception as e:
-            messagebox.showerror("Error", f"Diagnosis failed: {str(e)}")
+        per_class = results["per_class"]
+        class_rows = [
+            [
+                name,
+                f"{per_class[name]['precision']:.1%}",
+                f"{per_class[name]['recall']:.1%}",
+                f"{per_class[name]['f1-score']:.1%}",
+                int(per_class[name]["support"]),
+            ]
+            for name in results["class_names"]
+        ]
+        class_table = pd.DataFrame(
+            class_rows,
+            columns=["Class", "Precision", "Recall", "F1 score", "Support"],
+        )
+        if int(class_table["Support"].sum()) != results["validation_samples"]:
+            raise ValueError(
+                "Per-class supports do not match the validation image count."
+            )
 
-    def generate_visual_report(self, disease_name, confidence, summary, recommendations):
-        os.makedirs("reports", exist_ok=True)
-        report_path = "reports/Ocular_Report.pdf"
+        matrix = results["confusion_matrix"]
+        confusion_figure = go.Figure(
+            data=go.Heatmap(
+                z=matrix,
+                x=results["class_names"],
+                y=results["class_names"],
+                colorscale="Blues",
+                text=matrix,
+                texttemplate="%{text}",
+                hovertemplate=(
+                    "Actual: %{y}<br>Predicted: %{x}<br>Images: %{z}<extra></extra>"
+                ),
+            )
+        )
+        confusion_figure.update_layout(
+            title="Confusion matrix",
+            xaxis_title="Predicted class",
+            yaxis_title="Actual class",
+            xaxis_tickangle=-35,
+        )
 
-        c = canvas.Canvas(report_path, pagesize=A4)
-        width, height = A4
+        f1_figure = go.Figure(
+            data=go.Bar(
+                x=results["class_names"],
+                y=[per_class[name]["f1-score"] for name in results["class_names"]],
+                marker_color="#2878b5",
+            )
+        )
+        f1_figure.update_layout(
+            title="Per-class F1 score",
+            yaxis_title="F1 score",
+            yaxis=dict(range=[0, 1], tickformat=".0%"),
+            xaxis_tickangle=-30,
+        )
+        return metrics_markdown, class_table, confusion_figure, f1_figure
 
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(50, height - 60, "Ocular Disease Recognition Report")
+    @staticmethod
+    def _create_report(disease, score, age, sex, recommendations):
+        file_descriptor, report_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(file_descriptor)
 
-        c.setFont("Helvetica", 12)
-        c.drawString(50, height - 100, f"Predicted Disease: {disease_name}")
-        c.drawString(50, height - 120, f"Confidence: {confidence:.2f}")
-        c.drawString(50, height - 140, f"Patient Age: {self.age_entry.get()}")
-        c.drawString(50, height - 160, f"Sex: {self.sex_var.get()}")
+        report = canvas.Canvas(report_path, pagesize=A4)
+        _, page_height = A4
+        report.setFont("Helvetica-Bold", 18)
+        report.drawString(48, page_height - 58, "Ocular Image Analysis")
+        report.setFont("Helvetica", 12)
+        report.drawString(48, page_height - 100, f"Model class: {disease}")
+        report.drawString(48, page_height - 122, f"Model score: {score:.1%}")
+        report.drawString(48, page_height - 144, f"Age: {age if age is not None else 'Not provided'}")
+        report.drawString(48, page_height - 166, f"Sex: {sex or 'Not provided'}")
+        report.setFont("Helvetica-Bold", 12)
+        report.drawString(48, page_height - 210, "Recommendations")
+        report.setFont("Helvetica", 10)
+        for line_index, line in enumerate(recommendations.splitlines()):
+            report.drawString(48, page_height - 232 - line_index * 16, line[:110])
+        report.setFont("Helvetica-Oblique", 9)
+        report.drawString(
+            48,
+            42,
+            "Educational output only; not a medical diagnosis.",
+        )
+        report.save()
+        return report_path
 
-        y_pos = height - 300
-        for i, path in enumerate(self.heatmap_paths):
-            if path and os.path.exists(path):
-                try:
-                    c.drawImage(path, 50 + i * 250, y_pos, width=200, height=200)
-                except Exception:
-                    pass
 
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(50, y_pos - 30, "Summary:")
-        text_obj = c.beginText(50, y_pos - 50)
-        text_obj.setFont("Helvetica", 11)
-        for line in summary.split("\n"):
-            text_obj.textLine(line)
-        c.drawText(text_obj)
+def build_app(predictor=None):
+    predictor = predictor or OcularPredictor()
 
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(50, y_pos - 200, "Recommendations:")
-        text_obj = c.beginText(50, y_pos - 220)
-        text_obj.setFont("Helvetica", 11)
-        for line in recommendations.split("\n"):
-            text_obj.textLine(line)
-        c.drawText(text_obj)
+    with gr.Blocks(
+        title="Ocular Disease Recognition",
+        theme=Soft(),
+    ) as app:
+        gr.Markdown(
+            "# Ocular Disease Recognition\n"
+            "Upload one or both fundus images for a model prediction, or review "
+            "the model's held-out validation metrics."
+        )
+        with gr.Tabs():
+            with gr.Tab("Image analysis"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        left_image = gr.Image(
+                            type="filepath",
+                            image_mode="RGB",
+                            label="Left eye image",
+                        )
+                        right_image = gr.Image(
+                            type="filepath",
+                            image_mode="RGB",
+                            label="Right eye image (optional)",
+                        )
+                        age = gr.Number(label="Age (optional)", precision=0)
+                        sex = gr.Dropdown(
+                            ["Female", "Male"],
+                            label="Sex (optional)",
+                            value=None,
+                        )
+                        diabetes = gr.Checkbox(label="Known diabetes")
+                        hypertension = gr.Checkbox(label="Known hypertension")
+                        analyze = gr.Button("Analyze image", variant="primary")
+                    with gr.Column(scale=2):
+                        prediction = gr.Label(
+                            label="Class scores",
+                            num_top_classes=len(DISEASE_CLASSES),
+                        )
+                        summary = gr.Markdown()
+                        recommendations = gr.Markdown()
+                        with gr.Row():
+                            left_heatmap = gr.Image(label="Left eye Grad-CAM")
+                            right_heatmap = gr.Image(label="Right eye Grad-CAM")
+                        report_file = gr.File(label="Download report")
 
-        c.save()
-        messagebox.showinfo("Report Generated", f"Visual report saved to {report_path}")
+                analyze.click(
+                    fn=predictor.predict,
+                    inputs=[
+                        left_image,
+                        right_image,
+                        age,
+                        sex,
+                        diabetes,
+                        hypertension,
+                    ],
+                    outputs=[
+                        prediction,
+                        summary,
+                        recommendations,
+                        left_heatmap,
+                        right_heatmap,
+                        report_file,
+                    ],
+                )
+
+            with gr.Tab("Validation metrics"):
+                gr.Markdown(
+                    "Evaluate the loaded checkpoint on the same deterministic, "
+                    "patient-grouped holdout split used during training. Evaluation "
+                    "runs only when requested and may take a few minutes. Retrain "
+                    "with the updated pipeline before interpreting these metrics; "
+                    "an existing checkpoint may have been trained with the old preprocessing."
+                )
+                evaluate = gr.Button("Evaluate validation set", variant="primary")
+                metrics = gr.Markdown()
+                per_class = gr.Dataframe(
+                    headers=["Class", "Precision", "Recall", "F1 score", "Support"],
+                    label="Per-class metrics",
+                    interactive=False,
+                )
+                with gr.Row():
+                    confusion_plot = gr.Plot(label="Confusion matrix")
+                    f1_plot = gr.Plot(label="Per-class F1")
+
+                evaluate.click(
+                    fn=predictor.evaluate,
+                    outputs=[metrics, per_class, confusion_plot, f1_plot],
+                )
+
+        gr.Markdown(
+            "> **Important:** This educational model is not a substitute for an "
+            "eye-care professional. Model scores are not calibrated clinical "
+            "probabilities."
+        )
+
+    return app
 
 
 if __name__ == "__main__":
-    app = OcularApp()
-    app.mainloop()
+    build_app().launch(server_name="127.0.0.1", share=False, show_error=True)
